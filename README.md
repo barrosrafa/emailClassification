@@ -52,6 +52,7 @@ A previsão automática é tratada como **sugestão**. O sistema não transforma
 | Classificação | Categorias `principal`, `spam`, `promocoes` e `redes_sociais`. |
 | Destaque | Mensagens `spam` e `promocoes` aparecem com fundo e borda vermelhos. |
 | Feedback | Botão **É propaganda / não importante** disponível na lista e no detalhe. |
+| Exclusão em massa | Botão **Excluir vermelhos** reclassifica a Inbox no backend e exclui somente mensagens `spam` ou `promocoes`, após confirmação. |
 | Treinamento | Retreinamento após feedback e treinamento periódico diário. |
 | Gerenciamento | Atualização da caixa de entrada, exclusão de mensagens e logout. |
 | Persistência | Modelo e feedback ficam em `backend/data/`, ignorados pelo Git. |
@@ -534,6 +535,24 @@ Resposta:
 
 ```json
 { "success": true }
+```
+
+### Excluir todas as mensagens vermelhas
+
+```http
+POST /api/mail/delete-promotional
+```
+
+O backend lista até 100 mensagens da Inbox, classifica novamente cada mensagem usando o modelo atual e exclui apenas as categorias `spam` e `promocoes`. A decisão é repetida no backend para não depender exclusivamente das previsões mantidas no navegador.
+
+O frontend solicita confirmação antes de executar a operação. A ação é permanente na conta Microsoft e retorna os identificadores excluídos:
+
+```json
+{
+  "success": true,
+  "deleted": 3,
+  "ids": ["AAMkAG...", "AAMkBG...", "AAMkCG..."]
+}
 ```
 
 ### Classificar texto

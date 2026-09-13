@@ -24,6 +24,16 @@ app.post('/api/auth/logout', (_req, res) => { auth.signOut(); res.json({ success
 app.get('/api/mail', asyncRoute(async (req, res) => res.json(await graph.listMessages(req.query.top))));
 app.get('/api/mail/:id', asyncRoute(async (req, res) => res.json(await graph.getMessage(req.params.id))));
 app.delete('/api/mail/:id', asyncRoute(async (req, res) => { await graph.deleteMessage(req.params.id); res.json({ success: true }); }));
+app.post('/api/mail/delete-promotional', asyncRoute(async (_req, res) => {
+  const messages = await graph.listMessages(100);
+  const classified = await Promise.all(messages.map(async (message) => ({
+    message,
+    prediction: await classifier.classify(`${message.subject || ''}\n${message.bodyPreview || ''}`)
+  })));
+  const promotional = classified.filter(({ prediction }) => classifier.isPromotionalCategory(prediction.category));
+  await Promise.all(promotional.map(({ message }) => graph.deleteMessage(message.id)));
+  res.json({ success: true, deleted: promotional.length, ids: promotional.map(({ message }) => message.id) });
+}));
 
 app.post('/api/classify', asyncRoute(async (req, res) => res.json(await classifier.classify(req.body.text || ''))));
 app.post('/api/learn', asyncRoute(async (req, res) => res.json(await classifier.learn(req.body))));

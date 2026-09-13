@@ -143,7 +143,11 @@ function stats() {
   return { feedback: feedback.length, labels: LABELS };
 }
 
-module.exports = { LABELS, classify, learn, dailyTrain, stats };
+function isPromotionalCategory(category) {
+  return category === 'spam' || category === 'promocoes';
+}
+
+module.exports = { LABELS, classify, learn, dailyTrain, stats, isPromotionalCategory };
 
 // Treinamento diário: exemplos confirmados pelo usuário são a fonte de verdade.
 const interval = Number(process.env.DAILY_TRAIN_INTERVAL_MS || 24 * 60 * 60 * 1000);
