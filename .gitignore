@@ -7,3 +7,4 @@ frontend/dist/
 .DS_Store
 
 frontend/.next/
+backend/data/

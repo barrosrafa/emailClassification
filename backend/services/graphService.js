@@ -21,7 +21,7 @@ async function listMessages(top = 50) {
 async function getMessage(messageId) {
   const client = await getGraphClient();
   return client.api(`/me/messages/${encodeURIComponent(messageId)}`)
-    .select('id,subject,from,receivedDateTime,body,isRead,toRecipients,ccRecipients,hasAttachments')
+    .select('id,subject,from,receivedDateTime,body,bodyPreview,isRead,toRecipients,ccRecipients,hasAttachments')
     .get();
 }
 
