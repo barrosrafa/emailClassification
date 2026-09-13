@@ -1,0 +1,7 @@
+{
+  "name": "emailclassification-frontend",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": { "dev": "next dev", "build": "next build", "start": "next start" },
+  "dependencies": { "dompurify": "^3.2.3", "next": "^15.1.3", "react": "^19.0.0", "react-dom": "^19.0.0" }
+}

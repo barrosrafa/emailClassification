@@ -1,0 +1,12 @@
+{
+  "name": "emailclassification",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Gerenciador de e-mails Outlook/Hotmail via Microsoft Graph",
+  "scripts": {
+    "install:all": "npm install --prefix backend && npm install --prefix frontend",
+    "dev": "concurrently \"npm run dev --prefix backend\" \"npm run dev --prefix frontend\"",
+    "start": "npm run start --prefix backend"
+  },
+  "devDependencies": { "concurrently": "^9.1.2" }
+}
