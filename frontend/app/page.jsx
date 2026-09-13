@@ -1,42 +1,406 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
-import DOMPurify from 'dompurify';
+import { useEffect, useState, useCallback } from 'react';
+import { useAuth } from '../src/hooks/useAuth';
+import { useClassification } from '../src/hooks/useClassification';
+import { useMessages } from '../src/hooks/useMessages';
 import * as api from '../src/services/api';
 
-const formatDate = (value) => value ? new Intl.DateTimeFormat('pt-BR', { dateStyle: 'short', timeStyle: 'short' }).format(new Date(value)) : '';
-const sender = (message) => message.from?.emailAddress?.name || message.from?.emailAddress?.address || 'Remetente desconhecido';
-const textOf = (message) => `${message.subject || ''}\n${message.bodyPreview || ''}\n${message.body?.content || ''}`;
-const isRedCategory = (category) => category === 'spam' || category === 'promocoes';
-
-function AuthPanel({ onAuthenticated }) {
-  const [loading, setLoading] = useState(false), [info, setInfo] = useState(null), [error, setError] = useState('');
-  const login = async () => { setLoading(true); setError(''); try { const result = await api.startDeviceCode(); if (!result?.userCode) throw new Error(result?.error || 'Código não retornado.'); setInfo(result); const timer = setInterval(async () => { const s = await api.status(); if (s.authenticated) { clearInterval(timer); setInfo(null); onAuthenticated(); } }, 2500); setTimeout(() => clearInterval(timer), 900000); } catch (e) { setError(e.message); } finally { setLoading(false); } };
-  return <section className="auth-card"><div className="eyebrow">OUTLOOK / HOTMAIL</div><h1>Caixa de entrada, sem ruído.</h1><p>Conecte sua conta Microsoft e ensine o classificador com um clique sempre que uma mensagem for propaganda.</p><button className="primary" onClick={login} disabled={loading}>{loading ? 'Gerando código…' : 'Conectar conta Microsoft'}</button>{info?.userCode && <div className="code-box"><strong>{info.userCode}</strong><span>{info.message}</span><a href={info.verificationUri} target="_blank" rel="noreferrer">Abrir microsoft.com/devicelogin</a></div>}{error && <p className="error">{error}</p>}</section>;
-}
+import AuthPanel from '../src/components/AuthPanel';
+import Toolbar from '../src/components/Toolbar';
+import FilterBar from '../src/components/FilterBar';
+import SearchBar from '../src/components/SearchBar';
+import MailList from '../src/components/MailList';
+import MailViewer from '../src/components/MailViewer';
+import Toast from '../src/components/Toast';
 
 export default function Page() {
-  const [auth, setAuth] = useState(null), [messages, setMessages] = useState([]), [selected, setSelected] = useState(null), [predictions, setPredictions] = useState({}), [learning, setLearning] = useState(null), [loading, setLoading] = useState(false), [bulkDeleting, setBulkDeleting] = useState(false), [error, setError] = useState(''), [notice, setNotice] = useState('');
-  const classifyMessages = async (items) => {
-    if (!items?.length) return;
+  const { auth, loading: authLoading, checkAuth, logout } = useAuth();
+  const {
+    predictions,
+    learningStatus,
+    classifying,
+    classifyBatch,
+    learn,
+    trainNow,
+    fetchStatus
+  } = useClassification();
+
+  const {
+    messages,
+    setMessages,
+    loading: messagesLoading,
+    nextLink,
+    folder,
+    activeTab,
+    setActiveTab,
+    searchQuery,
+    setSearchQuery,
+    sortBy,
+    setSortBy,
+    selectedIds,
+    loadMessages,
+    loadMore,
+    toggleSelect,
+    selectAll,
+    counts,
+    filteredMessages
+  } = useMessages(predictions);
+
+  const [selectedMessage, setSelectedMessage] = useState(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [actionBusy, setActionBusy] = useState(false);
+  const [toast, setToast] = useState(null);
+
+  // Carrega e classifica mensagens ao autenticar
+  const loadData = useCallback(async () => {
     try {
-      const payload = items.map((m) => ({ id: m.id, text: textOf(m) }));
-      const results = await api.classifyBatch(payload);
-      setPredictions(results);
-    } catch {
-      const results = await Promise.all(items.map(async (m) => [m.id, await api.classify(textOf(m))]));
-      setPredictions(Object.fromEntries(results));
+      const items = await loadMessages('inbox');
+      await classifyBatch(items);
+      await fetchStatus();
+    } catch (err) {
+      setToast({ type: 'error', message: err.message });
+    }
+  }, [loadMessages, classifyBatch, fetchStatus]);
+
+  useEffect(() => {
+    if (auth?.authenticated) {
+      loadData();
+    }
+  }, [auth?.authenticated, loadData]);
+
+  // Carregar mais mensagens da paginação
+  const handleLoadMore = async () => {
+    try {
+      const newItems = await loadMore();
+      if (newItems.length) {
+        await classifyBatch(newItems);
+      }
+    } catch (err) {
+      setToast({ type: 'error', message: err.message });
     }
   };
-  const load = useCallback(async () => { setLoading(true); setError(''); try { const items = await api.listMessages(); setMessages(items); await classifyMessages(items); setLearning(await api.learningStatus()); } catch (e) { setError(e.message); } finally { setLoading(false); } }, []);
-  useEffect(() => { api.status().then(setAuth).catch(() => setAuth({ authenticated: false })); }, []);
-  useEffect(() => { if (auth?.authenticated) load(); }, [auth, load]);
-  const open = async (id) => { try { setSelected({ ...(await api.getMessage(id)), ...(predictions[id] ? { classification: predictions[id] } : {}) }); } catch (e) { setError(e.message); } };
-  const remove = async (id) => { if (!window.confirm('Excluir este e-mail permanentemente?')) return; try { await api.deleteMessage(id); setMessages((all) => all.filter((m) => m.id !== id)); if (selected?.id === id) setSelected(null); } catch (e) { setError(e.message); } };
-  const teach = async (message, label = 'promocoes') => { try { const result = await api.learn({ messageId: message.id, text: textOf(message), label }); setLearning((old) => ({ ...(old || {}), feedback: (old?.feedback || 0) + 1 })); setPredictions((old) => ({ ...old, [message.id]: { category: label, confidence: 1, details: [] } })); setSelected((old) => old?.id === message.id ? { ...old, classification: { category: label, confidence: 1, details: [] } } : old); setNotice(`Aprendido: esta mensagem foi registrada como ${label === 'promocoes' ? 'propaganda' : label}. ${result.samples} exemplos usados no treino.`); } catch (e) { setError(e.message); } };
-  const trainNow = async () => { try { setNotice('Treinando com os exemplos confirmados…'); const result = await api.runLearning(); setLearning((old) => ({ ...(old || {}), feedback: result.feedback })); setNotice(`Treinamento concluído com ${result.samples} exemplos.`); } catch (e) { setError(e.message); } };
-  const deletePromotional = async () => { const promotional = messages.filter((message) => isRedCategory(predictions[message.id]?.category)); if (!promotional.length) { setNotice('Não há mensagens vermelhas para excluir.'); return; } if (!window.confirm(`Excluir permanentemente ${promotional.length} mensagem(ns) vermelha(s) classificadas como propaganda ou não importantes?`)) return; setBulkDeleting(true); setError(''); try { const result = await api.deletePromotionalMessages(); const deletedIds = new Set(result.ids || promotional.map((message) => message.id)); setMessages((all) => all.filter((message) => !deletedIds.has(message.id))); setPredictions((all) => Object.fromEntries(Object.entries(all).filter(([id]) => !deletedIds.has(id)))); if (selected && deletedIds.has(selected.id)) setSelected(null); setNotice(`${result.deleted} mensagem(ns) vermelha(s) excluída(s) permanentemente.`); } catch (e) { setError(e.message); } finally { setBulkDeleting(false); } };
-  if (!auth) return <div className="center">Carregando…</div>;
-  if (!auth.authenticated) return <main className="landing"><div className="brand">mail<span>desk</span></div><AuthPanel onAuthenticated={() => api.status().then(setAuth)} /></main>;
-  return <div className="app"><header><div className="brand">mail<span>desk</span></div><div className="account"><span>{auth.account}</span><button onClick={async () => { await api.logout(); setAuth({ authenticated: false }); }}>Sair</button></div></header><div className="toolbar"><div><div className="eyebrow">CAIXA DE ENTRADA INTELIGENTE</div><h2>{messages.length} mensagens</h2><p className="subline">Vermelho = propaganda ou não importante · feedback confirmado alimenta o modelo</p></div><div className="toolbar-actions"><button className="refresh" onClick={load} disabled={loading || bulkDeleting}>Atualizar</button><button className="bulk-delete" onClick={deletePromotional} disabled={loading || bulkDeleting}>{bulkDeleting ? 'Excluindo…' : 'Excluir vermelhos'}</button><button className="train" onClick={trainNow} disabled={bulkDeleting}>Treinar agora</button></div></div>{(error || notice) && <div className={error ? 'notice error' : 'notice'}>{error || notice}</div>}<div className="content"><aside>{loading ? <div className="empty">Buscando e classificando mensagens…</div> : messages.length === 0 ? <div className="empty">Sua caixa está vazia.</div> : messages.map((m) => { const prediction = predictions[m.id]; const red = isRedCategory(prediction?.category); return <article key={m.id} className={`mail ${!m.isRead ? 'unread' : ''} ${red ? 'promotional' : ''} ${selected?.id === m.id ? 'selected' : ''}`} onClick={() => open(m.id)}><div className="mail-top"><strong>{sender(m)}</strong><time>{formatDate(m.receivedDateTime)}</time></div><h3>{m.subject || '(sem assunto)'}</h3><p>{m.bodyPreview || 'Sem prévia disponível'}</p><div className="mail-label">{prediction ? `${prediction.category}${prediction.confidence ? ` · ${Math.round(prediction.confidence * 100)}%` : ''}` : 'classificando…'}</div><div className="mail-actions">{red && <button className="learn-small" onClick={(e) => { e.stopPropagation(); teach(m); }}>É propaganda</button>}<button aria-label="Excluir e-mail" onClick={(e) => { e.stopPropagation(); remove(m.id); }}>×</button></div></article>; })}</aside><section className="detail">{selected ? <><div className="detail-top"><div className="eyebrow">MENSAGEM · {selected.classification?.category || 'sem classificação'}</div><h1>{selected.subject || '(sem assunto)'}</h1><p>De <strong>{sender(selected)}</strong> · {formatDate(selected.receivedDateTime)}</p></div><div className="body" dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(selected.body?.content || '<p>Sem conteúdo.</p>') }} /><div className="detail-actions"><button className="learn" onClick={() => teach(selected)}>É propaganda / não importante</button><button className="danger" onClick={() => remove(selected.id)}>Excluir e-mail</button></div></> : <div className="empty detail-empty">Selecione uma mensagem para ler.</div>}</section></div><footer>{learning?.feedback || 0} feedbacks confirmados · aprendizado diário ativo</footer></div>;
+
+  // Abrir e-mail no detalhe
+  const handleOpenMessage = async (id) => {
+    setDetailLoading(true);
+    try {
+      const full = await api.getMessage(id);
+      setSelectedMessage({
+        ...full,
+        classification: predictions[id] || null
+      });
+      // Marca como lido automaticamente se estiver não lido
+      if (!full.isRead) {
+        await api.markAsRead(id, true);
+        setMessages((prev) =>
+          prev.map((m) => (m.id === id ? { ...m, isRead: true } : m))
+        );
+      }
+    } catch (err) {
+      setToast({ type: 'error', message: err.message });
+    } finally {
+      setDetailLoading(false);
+    }
+  };
+
+  // Ensinar nova categoria (Feedback Bidirecional)
+  const handleTeach = async (message, label) => {
+    try {
+      const result = await learn({ message, label });
+      if (selectedMessage?.id === message.id) {
+        setSelectedMessage((prev) =>
+          prev ? { ...prev, classification: { category: label, confidence: 1.0, details: [] } } : null
+        );
+      }
+      setToast({
+        type: 'notice',
+        message: `Aprendido: marcado como "${label}". ${result.samples} exemplos no modelo.`
+      });
+    } catch (err) {
+      setToast({ type: 'error', message: err.message });
+    }
+  };
+
+  // Exclusão permanente individual
+  const handleRemove = async (id) => {
+    if (!window.confirm('Excluir este e-mail permanentemente?')) return;
+    try {
+      await api.deleteMessage(id);
+      setMessages((prev) => prev.filter((m) => m.id !== id));
+      if (selectedMessage?.id === id) setSelectedMessage(null);
+      setToast({ type: 'notice', message: 'E-mail excluído com sucesso.' });
+    } catch (err) {
+      setToast({ type: 'error', message: err.message });
+    }
+  };
+
+  // Mover para pasta (com suporte a Desfazer)
+  const handleMove = async (id, destinationId) => {
+    try {
+      await api.moveMessage(id, destinationId);
+      const movedItem = messages.find((m) => m.id === id);
+      setMessages((prev) => prev.filter((m) => m.id !== id));
+      if (selectedMessage?.id === id) setSelectedMessage(null);
+
+      const folderName = destinationId === 'junkemail' ? 'Lixo' : 'Arquivo';
+      setToast({
+        type: 'notice',
+        message: `E-mail movido para ${folderName}.`,
+        duration: 10000,
+        undoAction: async () => {
+          // Desfazer: mover de volta para a Inbox
+          await api.moveMessage(id, 'inbox');
+          if (movedItem) setMessages((prev) => [movedItem, ...prev]);
+          setToast({ type: 'notice', message: 'Ação desfeita: e-mail retornado para a Caixa de Entrada.' });
+        }
+      });
+    } catch (err) {
+      setToast({ type: 'error', message: err.message });
+    }
+  };
+
+  // Alternar lido/não lido
+  const handleToggleRead = async (id, isRead) => {
+    try {
+      await api.markAsRead(id, isRead);
+      setMessages((prev) =>
+        prev.map((m) => (m.id === id ? { ...m, isRead } : m))
+      );
+      if (selectedMessage?.id === id) {
+        setSelectedMessage((prev) => (prev ? { ...prev, isRead } : null));
+      }
+    } catch (err) {
+      setToast({ type: 'error', message: err.message });
+    }
+  };
+
+  // Ações em Lote: Excluir Selecionados
+  const handleBatchDelete = async () => {
+    const ids = Array.from(selectedIds);
+    if (!ids.length) return;
+    if (!window.confirm(`Excluir permanentemente ${ids.length} mensagem(ns) selecionada(s)?`)) return;
+
+    setActionBusy(true);
+    try {
+      await api.batchDeleteMessages(ids);
+      const idSet = new Set(ids);
+      setMessages((prev) => prev.filter((m) => !idSet.has(m.id)));
+      if (selectedMessage && idSet.has(selectedMessage.id)) setSelectedMessage(null);
+      selectAll(false);
+      setToast({ type: 'notice', message: `${ids.length} mensagem(ns) excluída(s) em lote.` });
+    } catch (err) {
+      setToast({ type: 'error', message: err.message });
+    } finally {
+      setActionBusy(false);
+    }
+  };
+
+  // Ações em Lote: Marcar como lidos
+  const handleBatchMarkAsRead = async () => {
+    const ids = Array.from(selectedIds);
+    if (!ids.length) return;
+    setActionBusy(true);
+    try {
+      await Promise.all(ids.map((id) => api.markAsRead(id, true)));
+      const idSet = new Set(ids);
+      setMessages((prev) =>
+        prev.map((m) => (idSet.has(m.id) ? { ...m, isRead: true } : m))
+      );
+      selectAll(false);
+      setToast({ type: 'notice', message: `${ids.length} mensagem(ns) marcada(s) como lidas.` });
+    } catch (err) {
+      setToast({ type: 'error', message: err.message });
+    } finally {
+      setActionBusy(false);
+    }
+  };
+
+  // Ações em Lote: Mover para Arquivo
+  const handleBatchMoveToArchive = async () => {
+    const ids = Array.from(selectedIds);
+    if (!ids.length) return;
+    setActionBusy(true);
+    try {
+      await Promise.all(ids.map((id) => api.moveMessage(id, 'archive')));
+      const idSet = new Set(ids);
+      setMessages((prev) => prev.filter((m) => !idSet.has(m.id)));
+      if (selectedMessage && idSet.has(selectedMessage.id)) setSelectedMessage(null);
+      selectAll(false);
+      setToast({ type: 'notice', message: `${ids.length} mensagem(ns) arquivada(s).` });
+    } catch (err) {
+      setToast({ type: 'error', message: err.message });
+    } finally {
+      setActionBusy(false);
+    }
+  };
+
+  // Excluir todas as mensagens vermelhas (spam / promocoes)
+  const handleDeletePromotional = async () => {
+    const redMessages = messages.filter((m) => {
+      const cat = predictions[m.id]?.category;
+      return cat === 'spam' || cat === 'promocoes';
+    });
+
+    if (!redMessages.length) {
+      setToast({ type: 'notice', message: 'Nenhuma mensagem vermelha encontrada.' });
+      return;
+    }
+
+    if (!window.confirm(`Excluir permanentemente ${redMessages.length} mensagem(ns) classificadas como propaganda ou spam?`)) return;
+
+    setActionBusy(true);
+    try {
+      const res = await api.deletePromotionalMessages();
+      const deletedIds = new Set(res.ids || redMessages.map((m) => m.id));
+      setMessages((prev) => prev.filter((m) => !deletedIds.has(m.id)));
+      if (selectedMessage && deletedIds.has(selectedMessage.id)) setSelectedMessage(null);
+      setToast({ type: 'notice', message: `${res.deleted} mensagem(ns) vermelha(s) excluída(s).` });
+    } catch (err) {
+      setToast({ type: 'error', message: err.message });
+    } finally {
+      setActionBusy(false);
+    }
+  };
+
+  // Executar treino manual imediato
+  const handleTrainNow = async () => {
+    setActionBusy(true);
+    try {
+      setToast({ type: 'notice', message: 'Treinando com feedbacks confirmados…' });
+      const res = await trainNow();
+      setToast({ type: 'notice', message: `Treinamento concluído: ${res.samples || 0} exemplos usados.` });
+    } catch (err) {
+      setToast({ type: 'error', message: err.message });
+    } finally {
+      setActionBusy(false);
+    }
+  };
+
+  // Executar limpeza automática (Auto-clean)
+  const handleRunAutoClean = async () => {
+    setActionBusy(true);
+    try {
+      const res = await api.runAutoClean({ dryRun: false, action: 'move', minDaysOld: 7 });
+      if (res.processed > 0) {
+        setToast({ type: 'notice', message: `Auto-clean: ${res.processed} mensagem(ns) antiga(s) arquivada(s).` });
+        loadData();
+      } else {
+        setToast({ type: 'notice', message: 'Auto-clean: Nenhuma mensagem promocional com mais de 7 dias encontrada.' });
+      }
+    } catch (err) {
+      setToast({ type: 'error', message: err.message });
+    } finally {
+      setActionBusy(false);
+    }
+  };
+
+  if (authLoading) return <div className="center">Carregando…</div>;
+
+  if (!auth?.authenticated) {
+    return (
+      <main className="landing">
+        <div className="brand">
+          mail<span>desk</span>
+        </div>
+        <AuthPanel onAuthenticated={checkAuth} />
+      </main>
+    );
+  }
+
+  return (
+    <div className="app">
+      <header>
+        <div className="brand">
+          mail<span>desk</span>
+        </div>
+        <div className="account">
+          <span>{auth.account}</span>
+          <button type="button" onClick={logout}>
+            Sair
+          </button>
+        </div>
+      </header>
+
+      {/* Barra de Ações Principais */}
+      <Toolbar
+        totalCount={messages.length}
+        selectedCount={selectedIds.size}
+        loading={messagesLoading || classifying}
+        bulkBusy={actionBusy}
+        onRefresh={loadData}
+        onDeleteSelected={handleBatchDelete}
+        onMarkSelectedAsRead={handleBatchMarkAsRead}
+        onMoveSelectedToArchive={handleBatchMoveToArchive}
+        onDeletePromotional={handleDeletePromotional}
+        onTrainNow={handleTrainNow}
+        onRunAutoClean={handleRunAutoClean}
+      />
+
+      {/* Controles: Abas de Categoria e Pesquisa/Ordenação */}
+      <div className="controls-bar">
+        <FilterBar
+          activeTab={activeTab}
+          onTabChange={setActiveTab}
+          counts={counts}
+        />
+        <SearchBar
+          onSearch={setSearchQuery}
+          onSort={setSortBy}
+          currentSort={sortBy}
+        />
+      </div>
+
+      {/* Notificação Toast */}
+      {toast && (
+        <Toast
+          toast={toast}
+          onDismiss={() => setToast(null)}
+          onUndo={(t) => {
+            if (t.undoAction) t.undoAction();
+            setToast(null);
+          }}
+        />
+      )}
+
+      {/* Conteúdo: Lista à esquerda, Leitor à direita */}
+      <div className="content">
+        <aside>
+          <MailList
+            messages={filteredMessages}
+            predictions={predictions}
+            selectedIds={selectedIds}
+            detailSelectedId={selectedMessage?.id}
+            onToggleSelect={toggleSelect}
+            onSelectAll={(checked) => selectAll(checked, filteredMessages)}
+            onOpen={handleOpenMessage}
+            onQuickTeach={(msg, label) => handleTeach(msg, label)}
+            onRemove={handleRemove}
+            loading={messagesLoading || classifying}
+            nextLink={nextLink}
+            onLoadMore={handleLoadMore}
+          />
+        </aside>
+
+        <MailViewer
+          message={selectedMessage}
+          prediction={selectedMessage ? predictions[selectedMessage.id] : null}
+          onTeach={handleTeach}
+          onRemove={handleRemove}
+          onMove={handleMove}
+          onToggleRead={handleToggleRead}
+          loadingAction={actionBusy || detailLoading}
+        />
+      </div>
+
+      <footer>
+        <div>
+          {learningStatus?.feedback || 0} feedbacks confirmados · aprendizado diário ativo
+        </div>
+        <div>
+          {classifying ? '⚡ Classificação híbrida em execução…' : 'Classificador pronto'}
+        </div>
+      </footer>
+    </div>
+  );
 }

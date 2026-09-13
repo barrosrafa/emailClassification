@@ -1,3 +1,4 @@
+const fs = require('fs');
 const path = require('path');
 require('dotenv').config({ path: path.resolve(__dirname, '../../.env') });
 require('dotenv').config({ path: path.resolve(__dirname, '../.env') });
@@ -8,22 +9,78 @@ const msal = require('@azure/msal-node');
 const clientId = process.env.CLIENT_ID;
 if (!clientId) throw new Error('CLIENT_ID não configurado. Copie .env.example para .env.');
 
+const DATA_DIR = path.resolve(__dirname, '../data');
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+const CACHE_PATH = path.join(DATA_DIR, 'msal-cache.json');
+
+// Plugin de persistência em disco do cache de tokens MSAL (SSD 3.4.1)
+const cachePlugin = {
+  beforeCacheAccess: async (cacheContext) => {
+    if (fs.existsSync(CACHE_PATH)) {
+      try {
+        const cacheData = fs.readFileSync(CACHE_PATH, 'utf8');
+        if (cacheData) cacheContext.tokenCache.deserialize(cacheData);
+      } catch (e) {
+        console.warn('[MSAL Cache] Falha ao ler cache:', e.message);
+      }
+    }
+  },
+  afterCacheAccess: async (cacheContext) => {
+    if (cacheContext.cacheHasChanged) {
+      try {
+        fs.writeFileSync(CACHE_PATH, cacheContext.tokenCache.serialize());
+      } catch (e) {
+        console.warn('[MSAL Cache] Falha ao gravar cache:', e.message);
+      }
+    }
+  },
+};
+
 const pca = new msal.PublicClientApplication({
   auth: {
     clientId,
     authority: `https://login.microsoftonline.com/${process.env.TENANT_ID || 'consumers'}`
-  }
+  },
+  cache: { cachePlugin },
+  system: { loggerOptions: { loggerCallback: () => {}, piiLoggingEnabled: false } }
 });
 
 let account = null;
 let tokenResponse = null;
 let activeFlow = null;
 
+// Inicializa restaurando contas existentes do cache persistente
+(async function init() {
+  try {
+    const tokenCache = pca.getTokenCache();
+    const accounts = await tokenCache.getAllAccounts();
+    if (accounts.length > 0) {
+      account = accounts[0];
+      const silent = await pca.acquireTokenSilent({
+        account,
+        scopes: ['User.Read', 'Mail.ReadWrite', 'offline_access']
+      }).catch(() => null);
+      if (silent) {
+        tokenResponse = silent;
+        console.log(`[MSAL] Sessão restaurada com sucesso para: ${account?.username || 'desconhecido'}`);
+      }
+    }
+  } catch (err) {
+    console.warn('[MSAL] Inicialização do cache:', err.message);
+  }
+})();
+
 function isAuthenticated() {
-  return Boolean(account && tokenResponse?.accessToken);
+  return Boolean(account && (tokenResponse?.accessToken || account.homeAccountId));
 }
 
-function getAccount() { return account; }
+function getAccount() {
+  return account;
+}
+
+function getUserId() {
+  return account?.homeAccountId || 'default';
+}
 
 async function startDeviceCodeFlow() {
   if (activeFlow?.codeInfo) {
@@ -71,7 +128,7 @@ async function startDeviceCodeFlow() {
 
   const timer = setTimeout(() => {
     rejectCode(new Error('Tempo limite excedido ao comunicar com a Microsoft.'));
-  }, 25000);
+  }, 35000);
 
   codePromise.finally(() => clearTimeout(timer));
 
@@ -80,7 +137,12 @@ async function startDeviceCodeFlow() {
 }
 
 async function getAccessToken() {
+  if (!account) {
+    const accounts = await pca.getTokenCache().getAllAccounts().catch(() => []);
+    if (accounts.length > 0) account = accounts[0];
+  }
   if (!account) return null;
+
   try {
     const silent = await pca.acquireTokenSilent({
       account,
@@ -88,15 +150,30 @@ async function getAccessToken() {
     });
     tokenResponse = silent;
     return silent.accessToken;
-  } catch {
+  } catch (err) {
     return tokenResponse?.accessToken || null;
   }
 }
 
 function signOut() {
+  if (account) {
+    try {
+      pca.getTokenCache().removeAccount(account);
+    } catch {}
+  }
   account = null;
   tokenResponse = null;
   activeFlow = null;
+  if (fs.existsSync(CACHE_PATH)) {
+    try { fs.unlinkSync(CACHE_PATH); } catch {}
+  }
 }
 
-module.exports = { startDeviceCodeFlow, getAccessToken, isAuthenticated, getAccount, signOut };
+module.exports = {
+  startDeviceCodeFlow,
+  getAccessToken,
+  isAuthenticated,
+  getAccount,
+  getUserId,
+  signOut
+};

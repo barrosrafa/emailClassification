@@ -46,7 +46,13 @@ function ensureDataDir() {
 }
 
 function normalize(text = '') {
-  return String(text).toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9\s]/g, ' ');
+  return String(text)
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 function tokenize(text) {
@@ -129,7 +135,9 @@ async function getModel() {
   return modelPromise;
 }
 
-async function classify(text) {
+const { analyzeMetadata, aggregateSignals } = require('./metadataAnalyzer');
+
+async function classifyNlp(text) {
   const model = await getModel();
   const input = tf.tensor2d([tokenize(text)]);
   const output = model.predict(input);
@@ -141,10 +149,40 @@ async function classify(text) {
   return { category: top.category, confidence: top.probability, details };
 }
 
+function fuseScores(nlpDetails, metaScores, nlpWeight = 0.7, metaWeight = 0.3) {
+  const fused = LABELS.map(cat => {
+    const nlpProb = nlpDetails.find(d => d.category === cat)?.probability ?? 0.25;
+    const metaProb = metaScores[cat] ?? 0;
+    const score = (nlpProb * nlpWeight) + (metaProb * metaWeight);
+    return { category: cat, score };
+  });
+  const total = fused.reduce((s, i) => s + i.score, 0) || 1;
+  const finalDetails = fused.map(i => ({ category: i.category, probability: i.score / total }));
+  finalDetails.sort((a, b) => b.probability - a.probability);
+  return { category: finalDetails[0].category, confidence: finalDetails[0].probability, details: finalDetails };
+}
+
+async function classify(input) {
+  const isObject = typeof input === 'object' && input !== null;
+  const text = isObject ? (input.text || `${input.subject || ''}\n${input.bodyPreview || ''}\n${input.body?.content || ''}`) : String(input || '');
+  const nlpResult = await classifyNlp(text);
+
+  if (isObject && (input.from || input.internetMessageHeaders || input.body)) {
+    const signals = analyzeMetadata(input);
+    const metaScores = aggregateSignals(signals);
+    return fuseScores(nlpResult.details, metaScores);
+  }
+
+  return nlpResult;
+}
+
 async function classifyBatch(items = []) {
   if (!items.length) return {};
   const model = await getModel();
-  const tokenized = items.map((item) => tokenize(typeof item === 'string' ? item : item.text || ''));
+  const tokenized = items.map((item) => {
+    const text = typeof item === 'string' ? item : (item.text || `${item.subject || ''}\n${item.bodyPreview || ''}`);
+    return tokenize(text);
+  });
   const input = tf.tensor2d(tokenized);
   const output = model.predict(input);
   const data = await output.data();
@@ -156,11 +194,17 @@ async function classifyBatch(items = []) {
   items.forEach((item, i) => {
     const startIdx = i * numLabels;
     const values = Array.from(data.slice(startIdx, startIdx + numLabels));
-    const details = LABELS.map((category, index) => ({ category, probability: values[index] }));
-    details.sort((a, b) => b.probability - a.probability);
-    const top = details[0];
+    const nlpDetails = LABELS.map((category, index) => ({ category, probability: values[index] }));
     const key = (typeof item === 'object' && item && item.id) ? item.id : i;
-    results[key] = { category: top.category, confidence: top.probability, details };
+
+    if (typeof item === 'object' && item && (item.from || item.internetMessageHeaders || item.body)) {
+      const signals = analyzeMetadata(item);
+      const metaScores = aggregateSignals(signals);
+      results[key] = fuseScores(nlpDetails, metaScores);
+    } else {
+      nlpDetails.sort((a, b) => b.probability - a.probability);
+      results[key] = { category: nlpDetails[0].category, confidence: nlpDetails[0].probability, details: nlpDetails };
+    }
   });
 
   return results;
