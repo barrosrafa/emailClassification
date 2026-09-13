@@ -1,3 +1,4 @@
+process.noDeprecation = true;
 const path = require('path');
 require('dotenv').config({ path: path.resolve(__dirname, '../.env') });
 require('dotenv').config({ path: path.resolve(__dirname, '.env') });
@@ -26,16 +27,16 @@ app.get('/api/mail/:id', asyncRoute(async (req, res) => res.json(await graph.get
 app.delete('/api/mail/:id', asyncRoute(async (req, res) => { await graph.deleteMessage(req.params.id); res.json({ success: true }); }));
 app.post('/api/mail/delete-promotional', asyncRoute(async (_req, res) => {
   const messages = await graph.listMessages(100);
-  const classified = await Promise.all(messages.map(async (message) => ({
-    message,
-    prediction: await classifier.classify(`${message.subject || ''}\n${message.bodyPreview || ''}`)
-  })));
-  const promotional = classified.filter(({ prediction }) => classifier.isPromotionalCategory(prediction.category));
-  await Promise.all(promotional.map(({ message }) => graph.deleteMessage(message.id)));
-  res.json({ success: true, deleted: promotional.length, ids: promotional.map(({ message }) => message.id) });
+  const batchPredictions = await classifier.classifyBatch(
+    messages.map((message) => ({ id: message.id, text: `${message.subject || ''}\n${message.bodyPreview || ''}` }))
+  );
+  const promotional = messages.filter((message) => classifier.isPromotionalCategory(batchPredictions[message.id]?.category));
+  await Promise.all(promotional.map((message) => graph.deleteMessage(message.id)));
+  res.json({ success: true, deleted: promotional.length, ids: promotional.map((message) => message.id) });
 }));
 
 app.post('/api/classify', asyncRoute(async (req, res) => res.json(await classifier.classify(req.body.text || ''))));
+app.post('/api/classify-batch', asyncRoute(async (req, res) => res.json(await classifier.classifyBatch(req.body.items || []))));
 app.post('/api/learn', asyncRoute(async (req, res) => res.json(await classifier.learn(req.body))));
 app.get('/api/learning/status', (_req, res) => res.json(classifier.stats()));
 app.post('/api/learning/run', asyncRoute(async (_req, res) => res.json(await classifier.dailyTrain())));

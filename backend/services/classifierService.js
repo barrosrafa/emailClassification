@@ -73,7 +73,7 @@ function writeFeedback(items) {
 function createModel() {
   const model = tf.sequential();
   model.add(tf.layers.embedding({ inputDim: Object.keys(VOCAB).length, outputDim: 32, inputLength: MAX_SEQUENCE_LENGTH }));
-  model.add(tf.layers.lstm({ units: 32 }));
+  model.add(tf.layers.lstm({ units: 32, recurrentInitializer: 'glorotUniform' }));
   model.add(tf.layers.dropout({ rate: 0.3 }));
   model.add(tf.layers.dense({ units: 16, activation: 'relu' }));
   model.add(tf.layers.dense({ units: LABELS.length, activation: 'softmax' }));
@@ -82,27 +82,49 @@ function createModel() {
 }
 
 async function trainModel(extra = [], epochs = 18) {
-  const data = [...SEED, ...readFeedback().map(item => ({ text: item.text, label: item.label })), ...extra];
-  const xs = tf.tensor2d(data.map(item => tokenize(item.text)));
-  const ys = tf.tensor2d(data.map(item => LABELS.map((_, index) => index === item.label ? 1 : 0)));
-  const model = createModel();
-  await model.fit(xs, ys, { epochs, batchSize: Math.min(8, data.length), shuffle: true, verbose: 0 });
-  xs.dispose(); ys.dispose();
-  ensureDataDir();
-  await model.save(`file://${MODEL_DIR}`);
-  if (modelPromise) { const old = await modelPromise; old.dispose(); }
-  modelPromise = Promise.resolve(model);
-  return { samples: data.length };
+  if (trainingPromise) return trainingPromise;
+  trainingPromise = (async () => {
+    const data = [...SEED, ...readFeedback().map(item => ({ text: item.text, label: item.label })), ...extra];
+    const xs = tf.tensor2d(data.map(item => tokenize(item.text)));
+    const ys = tf.tensor2d(data.map(item => LABELS.map((_, index) => index === item.label ? 1 : 0)));
+    const model = createModel();
+    await model.fit(xs, ys, { epochs, batchSize: Math.min(8, data.length), shuffle: true, verbose: 0 });
+    xs.dispose(); ys.dispose();
+    ensureDataDir();
+    await model.save(`file://${MODEL_DIR}`);
+    if (modelPromise) {
+      const old = await modelPromise.catch(() => null);
+      if (old && typeof old.dispose === 'function') {
+        try { old.dispose(); } catch {}
+      }
+    }
+    modelPromise = Promise.resolve(model);
+    return { samples: data.length };
+  })().finally(() => {
+    trainingPromise = null;
+  });
+  return trainingPromise;
 }
 
 async function getModel() {
   ensureDataDir();
   if (!modelPromise) {
-    if (fs.existsSync(path.join(MODEL_DIR, 'model.json'))) {
-      modelPromise = tf.loadLayersModel(`file://${MODEL_DIR}/model.json`);
-    } else {
+    modelPromise = (async () => {
+      const modelJson = path.join(MODEL_DIR, 'model.json');
+      if (fs.existsSync(modelJson)) {
+        try {
+          return await tf.loadLayersModel(`file://${MODEL_DIR}/model.json`);
+        } catch (err) {
+          console.warn('[ML] Modelo corrompido detectado, retreinando do zero:', err.message);
+          try { fs.rmSync(MODEL_DIR, { recursive: true, force: true }); } catch {}
+        }
+      }
       await trainModel([], 24);
-    }
+      return await tf.loadLayersModel(`file://${MODEL_DIR}/model.json`);
+    })().catch((err) => {
+      modelPromise = null;
+      throw err;
+    });
   }
   return modelPromise;
 }
@@ -119,6 +141,31 @@ async function classify(text) {
   return { category: top.category, confidence: top.probability, details };
 }
 
+async function classifyBatch(items = []) {
+  if (!items.length) return {};
+  const model = await getModel();
+  const tokenized = items.map((item) => tokenize(typeof item === 'string' ? item : item.text || ''));
+  const input = tf.tensor2d(tokenized);
+  const output = model.predict(input);
+  const data = await output.data();
+  input.dispose(); output.dispose();
+
+  const numLabels = LABELS.length;
+  const results = {};
+
+  items.forEach((item, i) => {
+    const startIdx = i * numLabels;
+    const values = Array.from(data.slice(startIdx, startIdx + numLabels));
+    const details = LABELS.map((category, index) => ({ category, probability: values[index] }));
+    details.sort((a, b) => b.probability - a.probability);
+    const top = details[0];
+    const key = (typeof item === 'object' && item && item.id) ? item.id : i;
+    results[key] = { category: top.category, confidence: top.probability, details };
+  });
+
+  return results;
+}
+
 async function learn({ messageId, text, label }) {
   if (!messageId || !text || !LABELS.includes(label)) throw new Error('Dados de aprendizado inválidos');
   const feedback = readFeedback().filter(item => item.messageId !== messageId);
@@ -128,9 +175,7 @@ async function learn({ messageId, text, label }) {
 }
 
 async function retrain(epochs = 8) {
-  if (trainingPromise) return trainingPromise;
-  trainingPromise = trainModel([], epochs).finally(() => { trainingPromise = null; });
-  return trainingPromise;
+  return trainModel([], epochs);
 }
 
 async function dailyTrain() {
@@ -147,7 +192,7 @@ function isPromotionalCategory(category) {
   return category === 'spam' || category === 'promocoes';
 }
 
-module.exports = { LABELS, classify, learn, dailyTrain, stats, isPromotionalCategory };
+module.exports = { LABELS, classify, classifyBatch, learn, dailyTrain, stats, isPromotionalCategory };
 
 // Treinamento diário: exemplos confirmados pelo usuário são a fonte de verdade.
 const interval = Number(process.env.DAILY_TRAIN_INTERVAL_MS || 24 * 60 * 60 * 1000);

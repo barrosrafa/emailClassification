@@ -13,6 +13,7 @@ export const getMessage = (id) => request(`/mail/${encodeURIComponent(id)}`);
 export const deleteMessage = (id) => request(`/mail/${encodeURIComponent(id)}`, { method: 'DELETE' });
 export const deletePromotionalMessages = () => request('/mail/delete-promotional', { method: 'POST' });
 export const classify = (text) => request('/classify', { method: 'POST', body: JSON.stringify({ text }) });
+export const classifyBatch = (items) => request('/classify-batch', { method: 'POST', body: JSON.stringify({ items }) });
 export const learn = (payload) => request('/learn', { method: 'POST', body: JSON.stringify(payload) });
 export const learningStatus = () => request('/learning/status');
 export const runLearning = () => request('/learning/run', { method: 'POST' });

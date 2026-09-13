@@ -17,7 +17,17 @@ function AuthPanel({ onAuthenticated }) {
 
 export default function Page() {
   const [auth, setAuth] = useState(null), [messages, setMessages] = useState([]), [selected, setSelected] = useState(null), [predictions, setPredictions] = useState({}), [learning, setLearning] = useState(null), [loading, setLoading] = useState(false), [bulkDeleting, setBulkDeleting] = useState(false), [error, setError] = useState(''), [notice, setNotice] = useState('');
-  const classifyMessages = async (items) => { const results = await Promise.all(items.map(async (m) => [m.id, await api.classify(textOf(m))])); setPredictions(Object.fromEntries(results)); };
+  const classifyMessages = async (items) => {
+    if (!items?.length) return;
+    try {
+      const payload = items.map((m) => ({ id: m.id, text: textOf(m) }));
+      const results = await api.classifyBatch(payload);
+      setPredictions(results);
+    } catch {
+      const results = await Promise.all(items.map(async (m) => [m.id, await api.classify(textOf(m))]));
+      setPredictions(Object.fromEntries(results));
+    }
+  };
   const load = useCallback(async () => { setLoading(true); setError(''); try { const items = await api.listMessages(); setMessages(items); await classifyMessages(items); setLearning(await api.learningStatus()); } catch (e) { setError(e.message); } finally { setLoading(false); } }, []);
   useEffect(() => { api.status().then(setAuth).catch(() => setAuth({ authenticated: false })); }, []);
   useEffect(() => { if (auth?.authenticated) load(); }, [auth, load]);
