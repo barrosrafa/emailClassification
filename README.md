@@ -37,8 +37,9 @@ O fluxo principal da aplicação é o seguinte:
 4. O backend normaliza o texto, tokeniza o conteúdo e executa inferência no modelo TensorFlow.js.
 5. Mensagens classificadas como `spam` ou `promocoes` recebem destaque visual vermelho.
 6. O usuário pode abrir a mensagem, excluí-la ou confirmar que ela é propaganda.
-7. O feedback confirmado é salvo em `backend/data/feedback.json` e o modelo é retreinado.
-8. Um treinamento diário reprocessa os exemplos confirmados enquanto o backend estiver ativo.
+7. O feedback confirmado é salvo em `backend/data/feedback.json`.
+8. O feedback é colocado em uma fila de treinamento assíncrona; após um debounce, o treinamento é executado em um worker separado.
+9. Um treinamento periódico reprocessa os exemplos confirmados enquanto o backend estiver ativo.
 
 A previsão automática é tratada como **sugestão**. O sistema não transforma uma previsão não confirmada em dado de treinamento. Essa separação reduz o risco de realimentar erros do próprio modelo.
 
@@ -55,6 +56,8 @@ A previsão automática é tratada como **sugestão**. O sistema não transforma
 | Exclusão em massa | Botão **Excluir vermelhos** reclassifica a Inbox no backend e exclui somente mensagens `spam` ou `promocoes`, após confirmação. |
 | Treinamento | Retreinamento após feedback e treinamento periódico diário. |
 | Gerenciamento | Atualização da caixa de entrada, exclusão de mensagens e logout. |
+| Organização | Lista pastas, move mensagens, altera o estado de leitura e acessa anexos. |
+| Limpeza automática | Move ou exclui mensagens antigas de remetentes confirmados como `promocoes` ou `spam`, conforme configuração. |
 | Persistência | Modelo e feedback ficam em `backend/data/`, ignorados pelo Git. |
 
 ## Arquitetura
@@ -74,9 +77,10 @@ A aplicação é dividida em dois processos durante o desenvolvimento: um servid
 ┌─────────────────────────────┐
 │ Backend Express              │
 │ - Rotas REST                 │
-│ - Sessão MSAL em memória     │
+│ - Sessão MSAL com cache local │
 │ - Serviço Microsoft Graph    │
-│ - Serviço TensorFlow.js      │
+│ - Classificação NLP/híbrida  │
+│ - Fila de treinamento        │
 └─────────┬───────────┬───────┘
           │           │
           ▼           ▼
@@ -108,9 +112,15 @@ emailClassification/
 │   │   ├── feedback.json             # Exemplos rotulados pelo usuário
 │   │   └── modelo-email/             # model.json e pesos TensorFlow.js
 │   ├── services/
-│   │   ├── authService.js            # Sessão MSAL e Device Code Flow
-│   │   ├── classifierService.js      # Tokenização, modelo, inferência e treino
-│   │   └── graphService.js           # Operações Microsoft Graph
+│   │   ├── authService.js            # Sessão MSAL, Device Code Flow e cache
+│   │   ├── autoCleanService.js       # Limpeza automática periódica
+│   │   ├── classifierService.js      # Classificação, fusão de sinais e treino
+│   │   ├── classifierStrategy.js     # Estratégias TF-IDF, TensorFlow e híbrida
+│   │   ├── graphService.js           # Operações Microsoft Graph
+│   │   ├── metadataAnalyzer.js       # Análise heurística de metadados
+│   │   └── trainingQueue.js          # Fila de treinamento assíncrono
+│   ├── workers/
+│   │   └── trainWorker.js            # Worker thread de treinamento
 │   ├── package.json
 │   └── server.js                     # Aplicação Express e rotas REST
 ├── frontend/
@@ -134,7 +144,7 @@ O backend está em `backend/server.js` e expõe uma API REST sob o prefixo `/api
 
 ### Inicialização
 
-O servidor carrega as variáveis de ambiente, instancia o Express e importa os serviços de autenticação, Graph e classificação. O `classifierService` mantém o modelo em cache dentro do processo para evitar carregar `model.json` a cada requisição.
+O servidor carrega as variáveis de ambiente, instancia o Express e importa os serviços de autenticação, Graph, classificação, treinamento e limpeza automática. O `classifierService` mantém o modelo em cache dentro do processo para evitar carregar `model.json` a cada requisição.
 
 ### Tratamento de erros
 
@@ -148,7 +158,7 @@ As rotas assíncronas são envolvidas por um adaptador que converte exceções e
 
 ### `authService.js`
 
-O serviço usa um `PublicClientApplication` do MSAL. O `CLIENT_ID` é público e o fluxo não depende de client secret. O token de acesso e a conta ficam em memória no processo.
+O serviço usa um `PublicClientApplication` do MSAL. O `CLIENT_ID` é público e o fluxo não depende de client secret. O cache da MSAL é persistido em `backend/data/msal-cache.json`, restaurado na inicialização e atualizado quando o cache muda. A aplicação tenta restaurar silenciosamente uma conta ainda válida entre reinícios.
 
 O método `getAccessToken()` tenta primeiro obter um token silenciosamente. Se a renovação silenciosa não for possível, usa o token em memória enquanto ele permanecer válido.
 
@@ -158,7 +168,12 @@ O serviço cria um cliente Microsoft Graph com o token obtido pelo `authService`
 
 - listar mensagens da Inbox;
 - abrir uma mensagem completa;
-- excluir uma mensagem.
+- excluir uma mensagem;
+- listar pastas;
+- mover mensagens;
+- alterar o estado de leitura;
+- listar e obter anexos;
+- excluir mensagens em lote.
 
 A listagem limita o número de mensagens ao máximo de 100 e ordena os resultados por `receivedDateTime` decrescente.
 
@@ -176,6 +191,20 @@ O serviço concentra toda a lógica de machine learning:
 - treinamento periódico.
 
 O serviço também evita treinamentos concorrentes por meio de `trainingPromise`. Enquanto um treinamento está em andamento, novas solicitações reutilizam a mesma promessa.
+
+### Estratégias de classificação e metadados
+
+O padrão Strategy permite selecionar a implementação de classificação. O código contém `TfIdfStrategy`, baseada em TF-IDF com n-grams de 1 a 3, `TensorFlowStrategy`, baseada no modelo LSTM, e `HybridStrategy`, que combina a classificação NLP com sinais heurísticos de metadados.
+
+O `metadataAnalyzer` avalia o remetente, cabeçalhos RFC822 como `List-Unsubscribe`, `Precedence` e `X-Mailer`, além da densidade de links no conteúdo. Quando a entrada contém metadados de uma mensagem do Graph, a classificação híbrida combina o resultado NLP com os scores heurísticos usando peso `0.7` para NLP e `0.3` para metadados. O retorno híbrido também inclui `metadataSignals`.
+
+### Treinamento assíncrono
+
+O `trainingQueue` recebe os feedbacks confirmados e agrupa solicitações por debounce. O valor padrão é de 15 segundos e pode ser alterado por `TRAINING_DEBOUNCE_MS`. O treinamento é executado em `backend/workers/trainWorker.js` usando `worker_threads`, mantendo o processamento pesado fora do fluxo principal do servidor.
+
+### Limpeza automática
+
+O `autoCleanService` agenda uma limpeza periódica, com intervalo padrão de 12 horas. A rotina identifica mensagens antigas de remetentes já confirmados como `promocoes` ou `spam` e executa a ação configurada: `move` ou `delete`. `dryRun` permite simular a operação sem alterar as mensagens. A limpeza também pode ser iniciada manualmente pela API.
 
 ## Frontend
 
@@ -318,9 +347,9 @@ O aprendizado é supervisionado por confirmação do usuário. A aplicação nã
 4. O backend valida o rótulo.
 5. O backend remove um feedback anterior da mesma mensagem, se existir.
 6. O novo feedback é salvo em `feedback.json`.
-7. O modelo é retreinado com os dados base e todos os feedbacks.
-8. O modelo anterior é descartado da memória.
-9. O novo modelo passa a ser usado nas próximas inferências.
+7. O modelo é retreinado com os dados base e todos os feedbacks, e o modelo anterior é descartado da memória.
+8. O feedback também é colocado na fila de treinamento assíncrono.
+9. Após o debounce, o worker processa a fila; o novo modelo passa a ser usado nas próximas inferências.
 
 O botão da interface usa o rótulo `promocoes`. A API aceita qualquer uma das quatro categorias, permitindo que uma futura interface ofereça correção explícita para todos os rótulos.
 
@@ -449,6 +478,11 @@ Copie `.env.example` para `.env` e ajuste os valores:
 | `NEXT_PUBLIC_API_URL` | Não | `http://localhost:3001/api` | URL base da API usada pelo browser. |
 | `TRAIN_ON_START` | Não | `false` | Se `true`, executa treino ao iniciar. |
 | `DAILY_TRAIN_INTERVAL_MS` | Não | `86400000` | Intervalo do treinamento periódico em milissegundos. |
+| `TRAINING_DEBOUNCE_MS` | Não | `15000` | Tempo de debounce da fila de treinamento assíncrono. |
+| `AUTO_CLEAN_DRY_RUN` | Não | `false` | Se `true`, simula a limpeza sem mover ou excluir mensagens. |
+| `AUTO_CLEAN_ACTION` | Não | `move` | Ação da limpeza automática: `move` ou `delete`. |
+| `AUTO_CLEAN_DAYS` | Não | `7` | Idade mínima, em dias, para uma mensagem ser candidata. |
+| `AUTO_CLEAN_INTERVAL_MS` | Não | `43200000` | Intervalo da limpeza automática em milissegundos; o padrão é 12 horas. |
 
 Para testar o agendamento rapidamente, pode-se usar:
 
@@ -517,6 +551,14 @@ GET /api/mail?top=50
 
 O backend limita o parâmetro a 100 mensagens.
 
+### Listar pastas
+
+```http
+GET /api/mail/folders
+```
+
+Lista as pastas de e-mail disponíveis para a conta autenticada.
+
 ### Abrir mensagem
 
 ```http
@@ -524,6 +566,33 @@ GET /api/mail/:id
 ```
 
 O identificador deve ser codificado pelo cliente quando contiver caracteres especiais.
+
+### Mover mensagem
+
+```http
+POST /api/mail/:id/move
+Content-Type: application/json
+```
+
+Move a mensagem para a pasta informada. Se o corpo não informar um destino, o backend usa `archive`.
+
+### Alterar estado de leitura
+
+```http
+PATCH /api/mail/:id/read
+Content-Type: application/json
+```
+
+Atualiza o estado de leitura da mensagem conforme o campo booleano enviado pelo cliente.
+
+### Listar e obter anexos
+
+```http
+GET /api/mail/:id/attachments
+GET /api/mail/:id/attachments/:attachmentId
+```
+
+A primeira rota lista os metadados dos anexos. A segunda retorna o conteúdo do anexo como stream.
 
 ### Excluir mensagem
 
@@ -603,6 +672,33 @@ Corpo:
 ```
 
 Valores válidos para `label`: `principal`, `spam`, `promocoes` e `redes_sociais`.
+
+### Classificar vários textos
+
+```http
+POST /api/classify-batch
+Content-Type: application/json
+```
+
+Classifica vários itens em uma única chamada. O corpo deve conter um array `items`.
+
+### Excluir mensagens em lote
+
+```http
+POST /api/mail/batch-delete
+Content-Type: application/json
+```
+
+Exclui mensagens em lotes usando o recurso `$batch` do Microsoft Graph. Cada lote aceita até 20 mensagens.
+
+### Executar limpeza automática
+
+```http
+POST /api/auto-clean/run
+Content-Type: application/json
+```
+
+Executa manualmente a limpeza automática. O corpo pode substituir as opções `dryRun`, `action` e `minDaysOld` para aquela execução.
 
 ### Consultar status do aprendizado
 
@@ -721,13 +817,13 @@ npm install --prefix backend
 
 ## Limitações e evolução para produção
 
-A sessão atual fica em memória. Reiniciar o backend exige nova autenticação.
+A sessão é mantida pelo cache MSAL em `backend/data/msal-cache.json`, mas a restauração depende de uma conta e de um token que ainda possam ser usados silenciosamente; se isso não for possível, uma nova autenticação será necessária.
 
 O feedback e o modelo ficam em um único diretório local. Para múltiplos usuários, cada conta deve ter isolamento de sessão, exemplos e modelo.
 
 O modelo não possui conjunto de validação, matriz de confusão, métricas por classe ou controle de versões. Uma evolução recomendada é separar dados de treino e validação, registrar acurácia por versão e impedir regressões antes de ativar um novo modelo.
 
-O retreinamento completo cresce linearmente com a quantidade de exemplos. Para grandes volumes, considere filas de treinamento, armazenamento estruturado, batching e uma estratégia de versionamento de modelos.
+O retreinamento completo cresce linearmente com a quantidade de exemplos. A fila e o worker reduzem o bloqueio do servidor, mas não eliminam esse custo. Para grandes volumes, considere armazenamento estruturado, batching e uma estratégia de versionamento de modelos.
 
 O scheduler interno não é um mecanismo distribuído. Em produção, use um job scheduler confiável, controle de concorrência e observabilidade.
 
@@ -735,7 +831,7 @@ O CORS ainda é permissivo no código para facilitar o desenvolvimento local. Em
 
 As mensagens são classificadas apenas quando a Inbox é carregada. Para processamento contínuo, adicione sincronização incremental baseada em `delta` do Microsoft Graph ou um worker persistente, respeitando limites de API e privacidade.
 
-O aplicativo não move mensagens para pastas do Outlook. O destaque vermelho é visual na interface. Uma futura integração pode aplicar categorias do Microsoft Graph, mas essa mudança exige permissões, tratamento de erros e definição clara da política de automação.
+O destaque vermelho é visual na interface. O `autoCleanService` pode mover ou excluir mensagens conforme configuração. Essa automação deve ser habilitada com cautela, especialmente quando `AUTO_CLEAN_ACTION=delete`, porque a exclusão é destrutiva.
 
 ## Referências
 
