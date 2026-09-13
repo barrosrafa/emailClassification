@@ -9,8 +9,50 @@ const sender = (message) => message.from?.emailAddress?.name || message.from?.em
 
 function AuthPanel({ onAuthenticated }) {
   const [loading, setLoading] = useState(false), [info, setInfo] = useState(null), [error, setError] = useState('');
-  const login = async () => { setLoading(true); setError(''); try { const result = await api.startDeviceCode(); setInfo(result); if (result.userCode) { const timer = setInterval(async () => { const s = await api.status(); if (s.authenticated) { clearInterval(timer); setInfo(null); onAuthenticated(); } }, 2500); setTimeout(() => clearInterval(timer), 900000); } } catch (e) { setError(e.message); } finally { setLoading(false); } };
-  return <section className="auth-card"><div className="eyebrow">OUTLOOK / HOTMAIL</div><h1>Caixa de entrada, sem ruído.</h1><p>Conecte sua conta Microsoft com OAuth seguro. O token permanece no servidor e nunca chega ao navegador.</p><button className="primary" onClick={login} disabled={loading}>{loading ? 'Gerando código…' : 'Conectar conta Microsoft'}</button>{info?.userCode && <div className="code-box"><strong>{info.userCode}</strong><span>{info.message}</span><a href={info.verificationUri} target="_blank" rel="noreferrer">Abrir microsoft.com/devicelogin</a></div>}{error && <p className="error">{error}</p>}</section>;
+  const login = async () => {
+    setLoading(true);
+    setError('');
+    try {
+      const result = await api.startDeviceCode();
+      if (!result?.userCode) {
+        throw new Error(result?.error || result?.message || 'Código de dispositivo não retornado pela Microsoft.');
+      }
+      setInfo(result);
+      const timer = setInterval(async () => {
+        const s = await api.status();
+        if (s.authenticated) {
+          clearInterval(timer);
+          setInfo(null);
+          onAuthenticated();
+        }
+      }, 2500);
+      setTimeout(() => clearInterval(timer), 900000);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+  return (
+    <section className="auth-card">
+      <div className="eyebrow">OUTLOOK / HOTMAIL</div>
+      <h1>Caixa de entrada, sem ruído.</h1>
+      <p>Conecte sua conta Microsoft com OAuth seguro. O token permanece no servidor e nunca chega ao navegador.</p>
+      <button className="primary" onClick={login} disabled={loading}>
+        {loading ? 'Gerando código…' : 'Conectar conta Microsoft'}
+      </button>
+      {info?.userCode && (
+        <div className="code-box">
+          <strong>{info.userCode}</strong>
+          <span>{info.message}</span>
+          <a href={info.verificationUri} target="_blank" rel="noreferrer">
+            Abrir microsoft.com/devicelogin
+          </a>
+        </div>
+      )}
+      {error && <p className="error" style={{ marginTop: '16px', lineHeight: '1.4' }}>{error}</p>}
+    </section>
+  );
 }
 
 export default function Page() {
