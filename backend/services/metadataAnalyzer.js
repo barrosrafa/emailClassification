@@ -22,6 +22,25 @@ const RULES = {
   ],
 };
 
+/** Vetor estável [0, 1] consumido pela entrada multimodal do TensorFlow. */
+function metadataFeatureVector(message = {}) {
+  const headers = Array.isArray(message.internetMessageHeaders) ? message.internetMessageHeaders : [];
+  const getHeader = (name) => headers.find(h => String(h.name || '').toLowerCase() === name);
+  const sender = String(message.from?.emailAddress?.address || '').toLowerCase();
+  const content = String(message.body?.content || message.bodyPreview || '');
+  const links = (content.match(/<a\s|https?:\/\//gi) || []).length;
+  return [
+    /@.*mailchimp\.com$|@news\.|newsletter|marketing|promo|oferta/i.test(sender) ? 1 : 0,
+    /@.*linkedin\.com$|@.*facebookmail\.com$|@.*twitter\.com|@.*x\.com$|@.*instagram\.com$/i.test(sender) ? 1 : 0,
+    getHeader('list-unsubscribe') ? 1 : 0,
+    /bulk|list/i.test(getHeader('precedence')?.value || '') ? 1 : 0,
+    /mailchimp|sendgrid|campaign|hubspot|sendinblue|mailgun/i.test(getHeader('x-mailer')?.value || '') ? 1 : 0,
+    Math.min(links / 20, 1), Math.min(content.length / 5000, 1), /no-?reply@/i.test(sender) ? 1 : 0,
+    /[!?]{2,}|URGENTE|GANHE|GRÁTIS/i.test(content) ? 1 : 0, sender ? 1 : 0,
+    Math.min(headers.length / 20, 1), /unsubscribe|descadastre/i.test(content) ? 1 : 0
+  ];
+}
+
 function analyzeMetadata(message = {}) {
   const signals = [];
   if (!message) return signals;
@@ -70,4 +89,4 @@ function aggregateSignals(signals = []) {
   return scores;
 }
 
-module.exports = { RULES, analyzeMetadata, aggregateSignals };
+module.exports = { RULES, analyzeMetadata, aggregateSignals, metadataFeatureVector };

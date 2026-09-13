@@ -9,6 +9,7 @@ class TrainingQueue extends EventEmitter {
     this.processing = false;
     this.debounceTimer = null;
     this.DEBOUNCE_MS = Number(process.env.TRAINING_DEBOUNCE_MS || 15000); // 15 segundos
+    this.MIN_BATCH_SIZE = Number(process.env.TRAINING_MIN_BATCH_SIZE || 50);
     this.workerPath = path.resolve(__dirname, '../workers/trainWorker.js');
   }
 
@@ -29,6 +30,11 @@ class TrainingQueue extends EventEmitter {
     if (this.processing) {
       this.scheduleTraining(5000);
       return { status: 'waiting_current_job' };
+    }
+
+    if (this.queue.length < this.MIN_BATCH_SIZE) {
+      this.scheduleTraining(Math.max(this.DEBOUNCE_MS, 5000));
+      return { status: 'waiting_minimum_batch', pending: this.queue.length, minimum: this.MIN_BATCH_SIZE };
     }
 
     this.processing = true;
@@ -79,7 +85,8 @@ class TrainingQueue extends EventEmitter {
     return {
       processing: this.processing,
       pendingQueue: this.queue.length,
-      debounceMs: this.DEBOUNCE_MS
+      debounceMs: this.DEBOUNCE_MS,
+      minimumBatchSize: this.MIN_BATCH_SIZE
     };
   }
 }
